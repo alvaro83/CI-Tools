@@ -38,6 +38,11 @@ This scripts allow to automatically compare the results of a regression run in a
                              the test cases that fail simultaneously in both local
                              and reference jobs
        --color               Show results with beautiful colors
+       --compare COMPARE     Number of previous executions to the reference one to
+                             compare with. Useful to see if there are unstable test
+                             cases
+       --test-suite TEST_SUITE [TEST_SUITE ...]
+                             Test suite names to filter results
        
 Example of usage:
 
@@ -82,6 +87,25 @@ It will show the test cases that have fail in any or both of the local execution
     +------------------------------+--------------+--------------+-----------------+
     
 The --color option shows the results with beautiful color formatting to make visualization easier.
+
+The argument --test-suite allows to filter results to show only test cases for the specified test suites.
+
+    $ compareRegressionResults.py \
+    --local https://myjenkinsserver/job/localjob/6/ \
+            https://myjenkinsserver/job/localjob/7/ \
+    --reference https://myjenkinsserver/job/referencejob/55/
+    --test-suite test_suite_001 test_suite_007
+    
+    +------------------------------+--------------+--------------+-----------------+
+    | Test case                    | Local status | Local status |Reference status |
+    +------------------------------+--------------+--------------+-----------------+
+    | test_suite_001.test_case_023 | FAILED       | FIXED        | PASSED          |
+    |                              |              |              |                 |
+    | test_suite_007.test_case_092 | FAILED       | FIXED        | PASSED          |
+    |                              |              |              |                 |
+    +------------------------------+--------------+--------------+-----------------+
+    | #elements: 2                                                                 |
+    +------------------------------+--------------+--------------+-----------------+
 
 It is possible to compare with a customized number of reference jobs. When the option --compare is enabled, the script still
 shows the test cases that have failed in the local job(s) but have passed in the one indicated as reference, but a new column
