@@ -7,10 +7,14 @@
 import urllib2
 import argparse
 import re
+import os
+import threading
+import sys
 
 from collections import defaultdict
 from display.table import Table
 from display.console_colors import color_ok, color_error
+from display.unbuffered import Unbuffered
 
 def main():
     parser = argparse.ArgumentParser(description="Show the test cases that fail in a local Jenkins job execution but pass in a reference Jenkins job execution")
@@ -22,97 +26,121 @@ def main():
     parser.add_argument("--color", required=False, action='store_true', help='Show results with beautiful colors')
     parser.add_argument("--compare", required=False, type=check_positive,
                         help='Number of previous executions to the reference one to compare with. Useful to see if there are unstable test cases')
+    parser.add_argument("--test-suite", required=False, nargs='+', help='Test suite names to filter results')
 
     args = parser.parse_args()
     url_local = args.local
     url_ref = args.reference
-
-    print 'Reading data for reference URL ... ',
-
-    data_ref = read_url(url_ref)
-    suites_ref = get_suites(data_ref)
-    tcs_reference = get_all_tcs(suites_ref)
-    reference = set(tcs_reference)
-
-    print color_ok('DONE')
-
+    
     l = [['Test case']]
-
+    
     row = 0
     col = 0
     tc_show = dict()
-
+    
     local_check_status = ['FAILED', 'REGRESSION']
     ref_check_status = local_check_status if args.both_fail else ['PASSED', 'FIXED']
-
+    
+    reference = [set()]
+    tcs_reference = [dict()]
     local = [set() for x in range(len(url_local))]
     tcs_local = [dict() for x in range(len(url_local))]
     i = 0
-
-    for url in url_local:
-        print 'Reading data for local URL ... ',
-        col += 1
-        l[0].append('Local status')
+    
+    def local_fetcher(i, lock):
         data_local = read_url(url)
         suites_local = get_suites(data_local)
-        tcs_local[i] = get_all_tcs(suites_local)
+        with lock:
+            tcs_local[i] = get_all_tcs(suites_local)
+            local[i] = set(tcs_local[i])
+            l[0].append('Local status')
+            
+    def ref_fetcher():
+        data_ref = read_url(url_ref)
+        suites_ref = get_suites(data_ref)
+        tcs_reference[0] = get_all_tcs(suites_ref)
+        reference[0] = set(tcs_reference[0])
+        
+    lock = threading.Lock()
+    threads = list()
 
-        local[i] = set(tcs_local[i])
+    print 'Reading data from URLs ... ',
+    t = threading.Thread(target=ref_fetcher)
+    threads.append(t)
+    t.start()
+    for url in url_local:
+        t = threading.Thread(target=local_fetcher, args=(i, lock))
+        threads.append(t)
+        t.start()
+        col += 1
         i += 1
+        
+    for t in threads:
+        t.join()
 
-        print color_ok('DONE')
+    print color_ok('DONE')
+
+    tcs_reference = tcs_reference[0]
+    reference = reference[0]
 
     i = 0
     print 'Comparing results ... ',
     for url in url_local:
-        for key in reference.intersection(local[i]):
-            if (tcs_local[i][key] in local_check_status) and (tcs_reference[key] in ref_check_status):
-                if key not in tc_show.keys():
-                    row += 1
-                    tc_show[key] = row
-                    l.extend([['']* (2+len(url_local))]) #['Test case', N*'Local status', 'Reference status']
-                    l[row][0] = key
-                for k in range(len(url_local)):
-                    l[row][k+1] = tcs_local[k].get(key, '')
-                    if args.color:
-                        if l[row][k+1] in local_check_status:
-                            l[row][k+1] = color_error(l[row][k+1])
-                        else:
-                            l[row][k+1] = color_ok(l[row][k+1])
+        for key in local[i]:
+            try:
+                if (tcs_local[i][key] in local_check_status) and (tcs_reference[key] in ref_check_status):
+                    tc_show, row, l = append_tc(key, tc_show, row, l, url_local, tcs_local, args.color, local_check_status)
+            except KeyError:
+                if tcs_local[i][key] in local_check_status:
+                    tc_show, row, l = append_tc(key, tc_show, row, l, url_local, tcs_local, args.color, local_check_status)
         i += 1
 
     for key in tc_show.keys():
-        if args.color:
-            if tcs_reference[key] in local_check_status:
-                l[tc_show[key]][-1] = color_error(tcs_reference[key])
+        try:
+            if args.color:
+                if tcs_reference[key] in local_check_status:
+                    l[tc_show[key]][-1] = color_error(tcs_reference[key])
+                else:
+                    l[tc_show[key]][-1] = color_ok(tcs_reference[key])
             else:
-                l[tc_show[key]][-1] = color_ok(tcs_reference[key])
-        else:
-            l[tc_show[key]][-1] = tcs_reference[key]
+                l[tc_show[key]][-1] = tcs_reference[key]
+        except KeyError:
+            l[tc_show[key]][-1] = ''
 
     l[0].append('Reference status')
 
     print color_ok('DONE')
+    
+    def comparer(i, lock):
+        url_N = get_previous_N_url(url_ref, i)
+        try:
+            data_ref = read_url(url_N)
+        except urllib2.HTTPError:
+            return
+        suites_ref = get_suites(data_ref)
+        tcs_reference_N = get_all_tcs(suites_ref)
+        for key in tc_show.keys():
+            try:
+                with lock:
+                    if tcs_reference_N[key] in local_check_status:
+                        tcs_comparison[key] += 1
+                    tcs_total[key] += 1
+            except KeyError:
+                pass
 
     if args.compare:
         print 'Comparing with previous regressions ... ',
         tcs_comparison = dict.fromkeys(tc_show.keys(), 0)
         tcs_total = dict.fromkeys(tc_show.keys(), 0)
+
+        lock = threading.Lock()
+        threads = list()
         for i in range(1, args.compare+1):
-            url_N = get_previous_N_url(url_ref, i)
-            try:
-                data_ref = read_url(url_N)
-            except urllib2.HTTPError:
-                continue
-            suites_ref = get_suites(data_ref)
-            tcs_reference_N = get_all_tcs(suites_ref)
-            for key in tc_show.keys():
-                try:
-                    if tcs_reference_N[key] in local_check_status:
-                        tcs_comparison[key] += 1
-                    tcs_total[key] += 1
-                except KeyError:
-                    pass
+            t = threading.Thread(target=comparer, args=(i, lock))
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
 
         l[0].append('#fail (total) in previous reference executions')
 
@@ -123,7 +151,25 @@ def main():
 
     print 'Showing results ... '
 
-    print Table(l, [0, 30, 40, 40], spacing=True, count=True)
+    header = l[0]
+
+    l.pop(0)
+
+    if args.test_suite:
+        l2 = [[]]
+        for suite in args.test_suite:
+            l2 += filter(lambda x: x[0].startswith(suite), l[1:])
+    else:
+        l2 = l
+
+    l2.sort()
+    l2.insert(0, header)
+
+    try:
+        cols = get_terminal_width()
+        print Table(l2, [3*cols/7, cols/7, cols/7, 2*cols/7], spacing=True, count=True)
+    except:
+        print Table(l2, [0, 30, 40, 60], spacing=True, count=True)
 
 
 
@@ -199,7 +245,16 @@ def get_previous_N_url(url, N):
     url = '/'.join(l[0:len(l)-1]) + '/' + str(int(j)-int(N))
     return url
 
+def get_terminal_size():
+    rows, cols = os.popen('stty size', 'r').read().split()
+    return int(rows), int(cols)
+
+def get_terminal_width():
+    rows, cols = get_terminal_size()
+    return cols
+
 
 if __name__ == "__main__":
+    sys.stdout = Unbuffered(sys.stdout)
     main()
     exit(0)
